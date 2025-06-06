@@ -48,7 +48,7 @@ spec:
         set -e
         python -m pip install --upgrade pip wheel
         pip install -r requirements.txt
-        pip install nose coverage
+        pip install nose coverage # Ensure nose and coverage are installed
         nosetests $(params.args)
 ---
 apiVersion: tekton.dev/v1beta1
@@ -62,12 +62,20 @@ spec:
   steps:
     - name: lint
       image: python:3.9-slim
-      workingDir: $(workspaces.source.path)
+      workingDir: $(workspaces.source.path) # This will be /workspace/output/
       script: |
         #!/bin/bash
         set -e
         python -m pip install --upgrade pip wheel
         pip install flake8
+
+        echo "--- Current Working Directory ---"
+        pwd
+        echo "--- Contents of Workspace ---"
+        ls -R . # List all files and directories recursively from the current directory
+        echo "-----------------------------"
+
+        # Now try to run flake8
         flake8 service --count --select=E9,F63,F7,F82 --show-source --statistics
         flake8 service --count --max-complexity=10 --max-line-length=127 --statistics
 ---
@@ -131,8 +139,6 @@ spec:
         #!/usr/bin/env bash
         set -ex
 
-        # Allow insecure registry for image-registry.openshift-image-registry.svc:5000
-        # This is common in OpenShift dev environments
         mkdir -p /etc/containers
         echo 'unqualified-search-registries = ["registry.access.redhat.com", "registry.redhat.io"]' > /etc/containers/registries.conf
         echo '[registries.insecure]' >> /etc/containers/registries.conf
