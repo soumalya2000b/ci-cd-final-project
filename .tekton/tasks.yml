@@ -21,16 +21,9 @@ spec:
         #!/usr/bin/env sh
         set -eu
         echo "Removing all files from ${WORKSPACE_SOURCE_PATH} ..."
-        # Delete any existing contents of the directory if it exists.
-        #
-        # We don't just "rm -rf ${WORKSPACE_SOURCE_PATH}" because ${WORKSPACE_SOURCE_PATH} might be "/"
-        # or the root of a mounted volume.
         if [ -d "${WORKSPACE_SOURCE_PATH}" ] ; then
-          # Delete non-hidden files and directories
           rm -rf "${WORKSPACE_SOURCE_PATH:?}"/*
-          # Delete files and directories starting with . but excluding ..
           rm -rf "${WORKSPACE_SOURCE_PATH}"/.[!.]*
-          # Delete files and directories starting with .. plus any other character
           rm -rf "${WORKSPACE_SOURCE_PATH}"/..?*
         fi
 ---
@@ -55,4 +48,192 @@ spec:
         set -e
         python -m pip install --upgrade pip wheel
         pip install -r requirements.txt
+        pip install nose coverage
         nosetests $(params.args)
+---
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: flake8-lint
+spec:
+  description: This task performs flake8 linting on Python code.
+  workspaces:
+    - name: source
+  steps:
+    - name: lint
+      image: python:3.9-slim
+      workingDir: $(workspaces.source.path)
+      script: |
+        #!/bin/bash
+        set -e
+        python -m pip install --upgrade pip wheel
+        pip install flake8
+        flake8 service --count --select=E9,F63,F7,F82 --show-source --statistics
+        flake8 service --count --max-complexity=10 --max-line-length=127 --statistics
+---
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: buildah
+spec:
+  description: Builds and pushes an OCI image using Buildah.
+  params:
+    - name: IMAGE
+      description: Reference of the image to be built.
+      type: string
+    - name: CONTAINER_IMAGE
+      description: Container image for Buildah.
+      type: string
+      default: quay.io/buildah/stable:v1.23.0
+    - name: STORAGE_DRIVER
+      description: Set the storage driver.
+      type: string
+      default: vfs
+    - name: DOCKERFILE
+      description: Path to the Dockerfile to build.
+      type: string
+      default: ./Dockerfile
+    - name: CONTEXT
+      description: Path to the directory to use as context.
+      type: string
+      default: .
+    - name: TLSVERIFY
+      description: Verify the TLS on the registry.
+      type: string
+      default: 'true'
+    - name: BUILD_EXTRA_ARGS
+      description: Extra parameters passed to buildah build.
+      type: string
+      default: ''
+    - name: PUSH_EXTRA_ARGS
+      description: Extra parameters passed to buildah push.
+      type: string
+      default: ''
+    - name: FORMAT
+      description: The format of the image manifest and metadata.
+      type: string
+      default: 'oci'
+  workspaces:
+    - name: source
+      description: The workspace where the code is located.
+  steps:
+    - name: build-and-push
+      image: $(params.CONTAINER_IMAGE)
+      workingDir: $(workspaces.source.path)
+      securityContext:
+        privileged: true # Buildah needs privileged mode
+      env:
+        - name: BUILDAH_FORMAT
+          value: $(params.FORMAT)
+        - name: BUILDAH_STORAGE_DRIVER
+          value: $(params.STORAGE_DRIVER)
+      script: |
+        #!/usr/bin/env bash
+        set -ex
+
+        # Allow insecure registry for image-registry.openshift-image-registry.svc:5000
+        # This is common in OpenShift dev environments
+        mkdir -p /etc/containers
+        echo 'unqualified-search-registries = ["registry.access.redhat.com", "registry.redhat.io"]' > /etc/containers/registries.conf
+        echo '[registries.insecure]' >> /etc/containers/registries.conf
+        echo 'registries = ["image-registry.openshift-image-registry.svc:5000"]' >> /etc/containers/registries.conf
+
+        buildah bud \
+          --tls-verify=$(params.TLSVERIFY) \
+          --format=$(params.FORMAT) \
+          $(params.BUILD_EXTRA_ARGS) \
+          -f $(params.DOCKERFILE) \
+          -t $(params.IMAGE) \
+          $(params.CONTEXT)
+
+        buildah push \
+          --tls-verify=$(params.TLSVERIFY) \
+          $(params.PUSH_EXTRA_ARGS) \
+          $(params.IMAGE) \
+          docker://$(params.IMAGE)
+---
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: git-clone
+spec:
+  description: Clones a Git repository.
+  params:
+    - name: url
+      description: Repository URL to clone from.
+      type: string
+    - name: revision
+      description: Revision to checkout (branch, tag, sha).
+      type: string
+      default: main
+    - name: depth
+      description: Perform a shallow clone, fetching only the last N commits.
+      type: string
+      default: '1'
+    - name: sslVerify
+      description: Set to 'false' to disable SSL verification.
+      type: string
+      default: 'true'
+    - name: submodules
+      description: Initialize and update submodules.
+      type: string
+      default: 'true'
+    - name: verbose
+      description: Log the commands that are executed.
+      type: string
+      default: 'true'
+    - name: deleteExisting
+      description: Clean out the contents of the destination directory.
+      type: string
+      default: 'false'
+  workspaces:
+    - name: output
+      description: The workspace to clone the repository into.
+  steps:
+    - name: clone
+      image: alpine/git:latest
+      script: |
+        #!/usr/bin/env sh
+        set -eu
+        if [ "$(params.verbose)" = "true" ] ; then
+          set -x
+        fi
+        CHECKOUT_DIR="$(workspaces.output.path)"
+
+        if [ "$(params.deleteExisting)" = "true" -a -d "${CHECKOUT_DIR}" ] ; then
+          rm -rf "${CHECKOUT_DIR}"
+        fi
+        mkdir -p "${CHECKOUT_DIR}"
+
+        git clone \
+          --depth "$(params.depth)" \
+          -b "$(params.revision)" \
+          --no-checkout \
+          "$(params.url)" \
+          "${CHECKOUT_DIR}"
+
+        cd "${CHECKOUT_DIR}"
+
+        git checkout -B "$(params.revision)"
+
+        if [ "$(params.submodules)" = "true" ] ; then
+          git submodule update --init --recursive
+        fi
+---
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: openshift-client
+spec:
+  description: A Task to run OpenShift client commands.
+  params:
+    - name: SCRIPT
+      type: string
+      description: The script to run using the OpenShift client.
+      default: |
+        #!/usr/bin/env bash
+        oc whoami
+  steps:
+    - name: run-script
+      image: registry.redhat.io/openshift4/ose-cli:latest
+      script: $(params.SCRIPT)
